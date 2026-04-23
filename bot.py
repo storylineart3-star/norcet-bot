@@ -14,6 +14,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import aiohttp.web
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -291,8 +293,13 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    webhook_path = "/telegram"
-    webhook_url = f"{RENDER_URL}{webhook_path}"
+    # ---------- Health check for Render ----------
+    web_app = aiohttp.web.Application()
+    async def health_check(request):
+        return aiohttp.web.Response(text="OK")
+    web_app.router.add_get("/", health_check)
+
+    webhook_url = f"{RENDER_URL}/telegram"
 
     logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
     app.run_webhook(
@@ -301,6 +308,7 @@ def main():
         webhook_url=webhook_url,
         secret_token="NorcetSecret123",
         drop_pending_updates=True,
+        web_app=web_app,
     )
 
 if __name__ == "__main__":
