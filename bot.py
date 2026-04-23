@@ -3,6 +3,8 @@ import json
 import gzip
 import random
 import logging
+import asyncio
+from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,20 +17,60 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load question bank
-with gzip.open("nursing_questions.json.gz", "rt", encoding="utf=8") as f:
+# ========== Configuration ==========
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # set on Render
+DATA_DIR = "data"
 
-   QUESTIONS = json.load(f)
+# ========== Persistent storage ==========
+def ensure_data_dir():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+
+def load_json(filename, default):
+    path = os.path.join(DATA_DIR, filename)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+def save_json(filename, data):
+    ensure_data_dir()
+    path = os.path.join(DATA_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ========== Load question bank ==========
+with gzip.open("nursing_questions.json.gz", "rt", encoding="utf-8") as f:
+    QUESTIONS = json.load(f)
 logger.info(f"Loaded {len(QUESTIONS)} nursing questions.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🩺 NORCET Quiz Bot ready!\n"
-        "Use /quiz to get a random nursing question."
-    )
+SUBJECTS = sorted({q["subject"] for q in QUESTIONS})
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = random.choice(QUESTIONS)
+# ========== Persistent user data ==========
+users = set(load_json("users.json", []))          # list of user IDs
+user_scores = load_json("scores.json", {})        # {user_id: {"correct": 0, "total": 0}}
+bot_stats = load_json("bot_stats.json", {"total_answers": 0})
+
+def save_users():
+    save_json("users.json", list(users))
+
+def save_scores():
+    save_json("scores.json", user_scores)
+
+def save_bot_stats():
+    save_json("bot_stats.json", bot_stats)
+
+def register_user(user_id: int):
+    if user_id not in users:
+        users.add(user_id)
+        save_users()
+
+# ========== Helpers ==========
+async def send_question(chat_id, context: ContextTypes.DEFAULT_TYPE, q=None):
+    """Send a single MCQ to a chat."""
+    if q is None:
+        q = random.choice(QUESTIONS)
     options = q["options"]
     correct_idx = q["correct_index"]
 
@@ -40,14 +82,108 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     context.chat_data["last_question"] = q
 
-    await update.message.reply_text(
-        f"❓ {q['question']}",
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"❓ {q['question']}",
         reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+# ========== Handlers ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+    await update.message.reply_text(
+        "🩺 NORCET Quiz Bot ready!\nUse /help to see all commands."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📚 *NORCET Quiz Bot Help*\n\n"
+        "/start – Welcome message\n"
+        "/quiz – Random 1 question\n"
+        "/quiz 10 – Random 10 questions (max 50)\n"
+        "/subjects – List available subjects\n"
+        "/subject Anatomy – 1 question from Anatomy\n"
+        "/subject Anatomy 5 – 5 questions from Anatomy\n"
+        "/stats – Your personal score (persistent)\n"
+        "/help – Show this message\n\n"
+        "👑 *Owner only:*\n"
+        "/broadcast <text> – Send message to all users\n"
+        "/botstats – Total users & answers"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+
+    args = context.args
+    if args and args[0].isdigit():
+        count = int(args[0])
+        count = max(1, min(count, 50))
+    else:
+        count = 1
+
+    chosen = random.sample(QUESTIONS, min(count, len(QUESTIONS)))
+    for q in chosen:
+        await send_question(update.effective_chat.id, context, q)
+
+async def subjects_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "📖 *Available subjects:*\n" + "\n".join([f"• {s}" for s in SUBJECTS])
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Please specify a subject. Example: /subject Anatomy")
+        return
+
+    # Check if last arg is a number
+    count = 1
+    if args[-1].isdigit():
+        count = int(args[-1])
+        count = max(1, min(count, 50))
+        subject_name = " ".join(args[:-1]).strip()
+    else:
+        subject_name = " ".join(args).strip()
+
+    matching = [q for q in QUESTIONS if q["subject"].lower() == subject_name.lower()]
+    if not matching:
+        await update.message.reply_text(
+            f"Subject '{subject_name}' not found. Use /subjects to see the list."
+        )
+        return
+
+    chosen = random.sample(matching, min(count, len(matching)))
+    for q in chosen:
+        await send_question(update.effective_chat.id, context, q)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+
+    data = user_scores.get(str(user_id), {"correct": 0, "total": 0})
+    correct = data["correct"]
+    total = data["total"]
+    percent = (correct / total * 100) if total > 0 else 0
+
+    await update.message.reply_text(
+        f"📊 *Your Stats*\n✅ Correct: {correct}\n❌ Wrong: {total - correct}\n📝 Total: {total}\n🎯 Accuracy: {percent:.1f}%",
+        parse_mode="Markdown",
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data == "done":
+        return  # ignore disabled buttons
+
+    user_id = query.from_user.id
+    register_user(user_id)
 
     _, chosen_str, correct_str = query.data.split(":")
     chosen = int(chosen_str)
@@ -61,10 +197,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = q["options"]
     explanation = q.get("explanation", "No explanation available.")
 
+    # Update personal stats
+    uid = str(user_id)
+    if uid not in user_scores:
+        user_scores[uid] = {"correct": 0, "total": 0}
+    user_scores[uid]["total"] += 1
     if chosen == correct:
+        user_scores[uid]["correct"] += 1
         result = "✅ Correct!"
     else:
         result = f"❌ Wrong! The correct answer is {chr(65+correct)}. {options[correct]}"
+    save_scores()
+
+    # Update global answer counter
+    bot_stats["total_answers"] = bot_stats.get("total_answers", 0) + 1
+    save_bot_stats()
 
     message = f"{result}\n\n📘 *Explanation:* {explanation}"
 
@@ -77,17 +224,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         message,
         reply_markup=InlineKeyboardMarkup(disabled_keyboard),
+        parse_mode="Markdown",
     )
 
+# ========== Owner Commands ==========
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("⛔ You are not authorised.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+
+    message_text = " ".join(context.args)
+    if not users:
+        await update.message.reply_text("No users yet.")
+        return
+
+    sent = 0
+    failed = 0
+    await update.message.reply_text(f"📢 Broadcasting to {len(users)} users...")
+
+    for uid in list(users):
+        try:
+            await context.bot.send_message(chat_id=uid, text=message_text)
+            sent += 1
+            await asyncio.sleep(0.05)  # avoid hitting rate limits
+        except Exception as e:
+            logger.warning(f"Failed to send to {uid}: {e}")
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ Broadcast finished.\nSent: {sent}\nFailed: {failed}"
+    )
+
+async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("⛔ You are not authorised.")
+        return
+
+    total_users = len(users)
+    total_answers = bot_stats.get("total_answers", 0)
+    await update.message.reply_text(
+        f"📈 *Bot Statistics*\n👥 Total users: {total_users}\n💬 Total answers: {total_answers}",
+        parse_mode="Markdown",
+    )
+
+# ========== Main ==========
 def main():
-    TOKEN = os.environ["BOT_TOKEN"]
     PORT = int(os.environ.get("PORT", 8000))
     RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
+    app.add_handler(CommandHandler("subjects", subjects_list))
+    app.add_handler(CommandHandler("subject", subject_quiz))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     webhook_path = "/telegram"
