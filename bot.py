@@ -3,8 +3,8 @@ import json
 import gzip
 import random
 import logging
-import asyncio
-from datetime import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,8 +14,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from aiohttp import web
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,6 +22,20 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 DATA_DIR = "data"
 PORT = int(os.environ.get("PORT", 8000))
+
+# ========== Health-check server (runs in a thread) ==========
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # keep logs clean
+
+def run_health_server(port):
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server listening on port {port}")
+    server.serve_forever()
 
 # ========== Persistent storage ==========
 def ensure_data_dir():
@@ -272,24 +284,8 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-# ========== Dummy HTTP server for Render health check ==========
-async def health_check(request):
-    return web.Response(text="OK")
-
-async def run_http_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health server running on port {PORT}")
-    # Keep running forever
-    await asyncio.Event().wait()
-
 # ========== Main ==========
-async def main():
-    # Build Telegram bot application
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Register all handlers
@@ -303,11 +299,12 @@ async def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Start polling and the dummy HTTP server concurrently
-    await asyncio.gather(
-        app.run_polling(drop_pending_updates=True),
-        run_http_server(),
-    )
+    # Start health-check server in a daemon thread
+    health_thread = threading.Thread(target=run_health_server, args=(PORT,), daemon=True)
+    health_thread.start()
+
+    # Start polling (blocking call – keeps the bot alive)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
