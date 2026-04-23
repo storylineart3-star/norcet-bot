@@ -286,6 +286,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Register command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -296,6 +297,15 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # ----- Build custom aiohttp web app with health check -----
+    update_queue = app.update_queue
+    secret_token = "NorcetSecret123"
+    web_app = Application.create_web_app(update_queue, secret_token)
+
+    async def health(request):
+        return aiohttp.web.Response(text="OK")
+    web_app.router.add_get("/", health)
+
     webhook_url = f"{RENDER_URL}/telegram"
 
     logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
@@ -303,9 +313,9 @@ def main():
         listen="0.0.0.0",
         port=PORT,
         webhook_url=webhook_url,
-        secret_token="NorcetSecret123",
+        secret_token=secret_token,
         drop_pending_updates=True,
-        request_handler=create_web_app,
+        web_app=web_app,          # <-- correct for v20.8
     )
 
 if __name__ == "__main__":
