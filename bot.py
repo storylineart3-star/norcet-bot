@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # ========== Configuration ==========
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # set on Render
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # Set on Render
 DATA_DIR = "data"
 
 # ========== Persistent storage ==========
@@ -50,8 +50,8 @@ logger.info(f"Loaded {len(QUESTIONS)} nursing questions.")
 SUBJECTS = sorted({q["subject"] for q in QUESTIONS})
 
 # ========== Persistent user data ==========
-users = set(load_json("users.json", []))          # list of user IDs
-user_scores = load_json("scores.json", {})        # {user_id: {"correct": 0, "total": 0}}
+users = set(load_json("users.json", []))
+user_scores = load_json("scores.json", {})
 bot_stats = load_json("bot_stats.json", {"total_answers": 0})
 
 def save_users():
@@ -70,7 +70,6 @@ def register_user(user_id: int):
 
 # ========== Helpers ==========
 async def send_question(chat_id, context: ContextTypes.DEFAULT_TYPE, q=None):
-    """Send a single MCQ to a chat."""
     if q is None:
         q = random.choice(QUESTIONS)
     options = q["options"]
@@ -143,7 +142,6 @@ async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please specify a subject. Example: /subject Anatomy")
         return
 
-    # Check if last arg is a number
     count = 1
     if args[-1].isdigit():
         count = int(args[-1])
@@ -182,7 +180,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "done":
-        return  # ignore disabled buttons
+        return
 
     user_id = query.from_user.id
     register_user(user_id)
@@ -199,7 +197,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = q["options"]
     explanation = q.get("explanation", "No explanation available.")
 
-    # Update personal stats
     uid = str(user_id)
     if uid not in user_scores:
         user_scores[uid] = {"correct": 0, "total": 0}
@@ -211,7 +208,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = f"❌ Wrong! The correct answer is {chr(65+correct)}. {options[correct]}"
     save_scores()
 
-    # Update global answer counter
     bot_stats["total_answers"] = bot_stats.get("total_answers", 0) + 1
     save_bot_stats()
 
@@ -253,7 +249,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=uid, text=message_text)
             sent += 1
-            await asyncio.sleep(0.05)  # avoid hitting rate limits
+            await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning(f"Failed to send to {uid}: {e}")
             failed += 1
@@ -275,6 +271,19 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+# ========== Custom web app with health check ==========
+def create_web_app(update_queue, secret_token):
+    """Create an aiohttp application that handles both Telegram webhook and health checks."""
+    # Use the library's built-in app creation (sets up /telegram route)
+    app = Application.create_web_app(update_queue, secret_token)
+
+    # Add a simple health check on root path
+    async def health(request):
+        return aiohttp.web.Response(text="OK")
+    app.router.add_get("/", health)
+
+    return app
+
 # ========== Main ==========
 def main():
     PORT = int(os.environ.get("PORT", 8000))
@@ -282,7 +291,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # Register command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -293,12 +302,6 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # ---------- Health check for Render ----------
-    web_app = aiohttp.web.Application()
-    async def health_check(request):
-        return aiohttp.web.Response(text="OK")
-    web_app.router.add_get("/", health_check)
-
     webhook_url = f"{RENDER_URL}/telegram"
 
     logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
@@ -308,7 +311,7 @@ def main():
         webhook_url=webhook_url,
         secret_token="NorcetSecret123",
         drop_pending_updates=True,
-        web_app=web_app,
+        request_handler=create_web_app,   # <-- custom handler with / health route
     )
 
 if __name__ == "__main__":
