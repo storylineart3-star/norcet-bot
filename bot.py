@@ -131,7 +131,7 @@ async def finish_quiz(chat_id, context, session):
         parse_mode="Markdown",
     )
 
-# ========== Quick‑start buttons (callback handlers) ==========
+# ========== Quick-start buttons (callback handlers) ==========
 QUICK_ACTIONS = {
     "quick_20": (20, None, "20 random questions"),
     "quick_anatomy20": (20, "Anatomy", "20 Anatomy questions"),
@@ -253,7 +253,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "done":
         return
 
-    # ----- handle quick‑start buttons -----
+    # ----- handle quick-start buttons -----
     if data in QUICK_ACTIONS:
         count, subject, _ = QUICK_ACTIONS[data]
         user_id = query.from_user.id
@@ -264,7 +264,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         session = init_quiz_session(questions)
         context.chat_data["quiz_session"] = session
-        # Delete the start message? We'll send the first question and leave the old one.
         await send_question_message(query.message.chat_id, context, session, questions[0])
         return
 
@@ -391,22 +390,15 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-# ========== Custom aiohttp app with health check ==========
-def create_web_app(update_queue, secret_token):
-    """Create aiohttp app with both /telegram webhook and / health endpoint."""
-    web_app = Application.create_web_app(update_queue, secret_token)
-    async def health(request):
-        return aiohttp.web.Response(text="OK")
-    web_app.router.add_get("/", health)
-    return web_app
-
-# ========== Main ==========
-def main():
+# ========== Custom aiohttp app and Main Entry ==========
+async def main():
     if not RENDER_URL:
         raise RuntimeError("Missing RENDER_EXTERNAL_URL environment variable")
 
+    # Build the Application
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -417,19 +409,46 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Build custom web app with health check
-    web_app = create_web_app(app.update_queue, "NorcetSecret123")
+    # 1. Set the webhook with Telegram API
     webhook_url = f"{RENDER_URL}/telegram"
-
-    logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url,
+    await app.bot.set_webhook(
+        url=webhook_url,
         secret_token="NorcetSecret123",
-        drop_pending_updates=True,
-        web_app=web_app,                 # ✅ this works in v20.8
+        drop_pending_updates=True
     )
 
+    # 2. Setup custom aiohttp server to receive updates
+    async def telegram_webhook(request):
+        # Verify secret token
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != "NorcetSecret123":
+            return aiohttp.web.Response(status=403)
+            
+        update_data = await request.json()
+        await app.update_queue.put(Update.de_json(data=update_data, bot=app.bot))
+        return aiohttp.web.Response()
+
+    async def health(request):
+        return aiohttp.web.Response(text="OK")
+
+    web_app = aiohttp.web.Application()
+    web_app.router.add_post("/telegram", telegram_webhook)
+    web_app.router.add_get("/", health)
+
+    # 3. Start aiohttp server and bot app concurrently
+    runner = aiohttp.web.AppRunner(web_app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", PORT)
+    
+    logger.info(f"Starting custom aiohttp webhook on port {PORT}, URL: {webhook_url}")
+    
+    async with app:
+        await app.start()
+        await site.start()
+        
+        # Keep the process running
+        stop_signal = asyncio.Event()
+        await stop_signal.wait()
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+    
