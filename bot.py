@@ -4,8 +4,6 @@ import gzip
 import random
 import logging
 import asyncio
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,6 +13,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import aiohttp.web
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -23,20 +23,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 DATA_DIR = "data"
 PORT = int(os.environ.get("PORT", 8000))
-
-# ========== Health-check server (runs in a thread) ==========
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
-
-def run_health_server(port):
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health server listening on port {port}")
-    server.serve_forever()
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 # ========== Persistent storage ==========
 def ensure_data_dir():
@@ -83,8 +70,17 @@ def register_user(user_id: int):
         save_users()
 
 # ========== Quiz session helpers ==========
+def pick_questions(count, subject=None):
+    """Return a list of count random questions, optionally filtered by subject."""
+    if subject:
+        pool = [q for q in QUESTIONS if q["subject"].lower() == subject.lower()]
+        if not pool:
+            return []
+    else:
+        pool = QUESTIONS
+    return random.sample(pool, min(count, len(pool)))
+
 def init_quiz_session(questions: list):
-    """Create a new session dict."""
     return {
         "questions": questions,
         "index": 0,
@@ -94,13 +90,11 @@ def init_quiz_session(questions: list):
     }
 
 async def send_question_message(chat_id, context: ContextTypes.DEFAULT_TYPE, session, q):
-    """Send a single question (current index) with inline buttons including Skip."""
     idx = session["index"]
     total = len(session["questions"])
     options = q["options"]
     correct_idx = q["correct_index"]
 
-    # Build keyboard: answer buttons + skip button
     keyboard = [
         [InlineKeyboardButton(f"A. {options[0]}", callback_data=f"ans:0:{correct_idx}")],
         [InlineKeyboardButton(f"B. {options[1]}", callback_data=f"ans:1:{correct_idx}")],
@@ -116,28 +110,77 @@ async def send_question_message(chat_id, context: ContextTypes.DEFAULT_TYPE, ses
         parse_mode="Markdown",
     )
 
+async def finish_quiz(chat_id, context, session):
+    total = len(session["questions"])
+    correct = session["correct"]
+    incorrect = session["incorrect"]
+    skipped = session["skipped"]
+    percent = (correct / total * 100) if total > 0 else 0
+
+    summary = (
+        "🏁 *Quiz Completed!*\n\n"
+        f"📝 Total questions: {total}\n"
+        f"✅ Correct: {correct}\n"
+        f"❌ Incorrect: {incorrect}\n"
+        f"⏭️ Skipped: {skipped}\n"
+        f"🎯 Accuracy: {percent:.1f}%"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=summary,
+        parse_mode="Markdown",
+    )
+
+# ========== Quick‑start buttons (callback handlers) ==========
+QUICK_ACTIONS = {
+    "quick_20": (20, None, "20 random questions"),
+    "quick_anatomy20": (20, "Anatomy", "20 Anatomy questions"),
+    "quick_50": (50, None, "50 random questions"),
+    "quick_rand50": (50, None, "50 random questions"),
+}
+
 # ========== Handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     register_user(user_id)
+
+    keyboard = [
+        [InlineKeyboardButton("🎲 Quick 20 Q&A", callback_data="quick_20")],
+        [InlineKeyboardButton("🦴 Anatomy 20", callback_data="quick_anatomy20")],
+        [InlineKeyboardButton("📚 Quick 50 Q&A", callback_data="quick_50")],
+        [InlineKeyboardButton("🔀 Random 50 Q&A", callback_data="quick_rand50")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="help_button")],
+    ]
+
     await update.message.reply_text(
-        "🩺 NORCET Quiz Bot ready!\nUse /help to see all commands."
+        "👋 *Welcome to NORCET Quiz Bot!*\n\n"
+        "Choose a quick test or type /help for all commands.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📚 *NORCET Quiz Bot Help*\n\n"
-        "/start – Welcome message\n"
-        "/quiz – Random 1 question\n"
-        "/quiz 10 – Start a 10‑question quiz (one by one with skip)\n"
-        "/subjects – List available subjects\n"
-        "/subject Anatomy – 1 question from Anatomy\n"
-        "/subject Anatomy 5 – 5 questions from Anatomy (one by one)\n"
-        "/stats – Your personal score (persistent)\n"
-        "/help – Show this message\n\n"
-        "👑 *Owner only:*\n"
-        "/broadcast <text> – Send message to all users\n"
-        "/botstats – Total users & answers"
+        "📚 *NORCET Quiz Bot – Full Help*\n\n"
+        "*Core Commands:*\n"
+        "/start – Welcome message with quick tests\n"
+        "/help – This detailed guide\n"
+        "/quiz – 1 random question\n"
+        "/quiz 10 – Start a 10‑question quiz (one by one, with skip)\n"
+        "/subjects – List all subjects\n"
+        "/subject Pharmacology – 1 question from Pharmacology\n"
+        "/subject Anatomy 20 – 20 Anatomy questions (one by one)\n\n"
+        "*During a quiz:*\n"
+        "Each question shows A/B/C/D buttons + a ⏭️ Skip button.\n"
+        "After you answer or skip, you see the explanation and the next question appears.\n"
+        "A progress indicator like *📌 Question 3/10* keeps you on track.\n"
+        "At the end, you get a summary: correct, incorrect, skipped, accuracy.\n\n"
+        "*Your stats:*\n"
+        "/stats – View your total correct/wrong/accuracy (persistent across sessions)\n\n"
+        "*Owner only:*\n"
+        "/broadcast <message> – Send a message to all users\n"
+        "/botstats – See total users and answers\n\n"
+        "💡 *Tip:* You can always stop a quiz by starting a new one with /quiz."
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -145,21 +188,15 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     register_user(user_id)
 
-    # Parse number of questions
     args = context.args
-    if args and args[0].isdigit():
-        count = int(args[0])
-        count = max(1, min(count, 50))
-    else:
-        count = 1
+    count = int(args[0]) if (args and args[0].isdigit()) else 1
+    count = max(1, min(count, 50))
 
-    # Pick random questions and create session
-    chosen = random.sample(QUESTIONS, min(count, len(QUESTIONS)))
-    session = init_quiz_session(chosen)
+    questions = pick_questions(count)
+    session = init_quiz_session(questions)
     context.chat_data["quiz_session"] = session
 
-    # Send first question
-    await send_question_message(update.effective_chat.id, context, session, chosen[0])
+    await send_question_message(update.effective_chat.id, context, session, questions[0])
 
 async def subjects_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📖 *Available subjects:*\n" + "\n".join([f"• {s}" for s in SUBJECTS])
@@ -174,7 +211,6 @@ async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please specify a subject. Example: /subject Anatomy")
         return
 
-    # Last argument may be a number
     count = 1
     if args[-1].isdigit():
         count = int(args[-1])
@@ -183,18 +219,17 @@ async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         subject_name = " ".join(args).strip()
 
-    matching = [q for q in QUESTIONS if q["subject"].lower() == subject_name.lower()]
-    if not matching:
+    questions = pick_questions(count, subject=subject_name)
+    if not questions:
         await update.message.reply_text(
             f"Subject '{subject_name}' not found. Use /subjects to see the list."
         )
         return
 
-    chosen = random.sample(matching, min(count, len(matching)))
-    session = init_quiz_session(chosen)
+    session = init_quiz_session(questions)
     context.chat_data["quiz_session"] = session
 
-    await send_question_message(update.effective_chat.id, context, session, chosen[0])
+    await send_question_message(update.effective_chat.id, context, session, questions[0])
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -216,11 +251,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
     if data == "done":
-        return  # ignore disabled buttons
+        return
 
-    user_id = query.from_user.id
-    register_user(user_id)
+    # ----- handle quick‑start buttons -----
+    if data in QUICK_ACTIONS:
+        count, subject, _ = QUICK_ACTIONS[data]
+        user_id = query.from_user.id
+        register_user(user_id)
+        questions = pick_questions(count, subject=subject)
+        if not questions:
+            await query.edit_message_text("No questions found for that subject.")
+            return
+        session = init_quiz_session(questions)
+        context.chat_data["quiz_session"] = session
+        # Delete the start message? We'll send the first question and leave the old one.
+        await send_question_message(query.message.chat_id, context, session, questions[0])
+        return
 
+    # ----- handle help button -----
+    if data == "help_button":
+        await help_command(update, context)
+        return
+
+    # ----- normal quiz answer/skip -----
     session = context.chat_data.get("quiz_session")
     if not session:
         await query.edit_message_text("⚠️ No active quiz. Start a new one with /quiz.")
@@ -228,28 +281,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Parse callback data
     if data.startswith("ans:"):
-        # Answer pressed
         _, chosen_str, correct_str = data.split(":")
         chosen = int(chosen_str)
         correct = int(correct_str)
         is_skip = False
     elif data.startswith("skip:"):
-        # Skip pressed
         _, correct_str = data.split(":")
         correct = int(correct_str)
         chosen = None
         is_skip = True
     else:
-        return  # unknown
+        return
 
-    # Get current question from session
     idx = session["index"]
     q = session["questions"][idx]
     options = q["options"]
     explanation = q.get("explanation", "No explanation available.")
 
-    # Update session counters and global stats
-    uid = str(user_id)
+    uid = str(query.from_user.id)
     if uid not in user_scores:
         user_scores[uid] = {"correct": 0, "total": 0}
 
@@ -270,10 +319,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_line = f"❌ Wrong! The correct answer is {chr(65+correct)}. {options[correct]}"
         save_scores()
 
-    # Build result message
     message = f"{result_line}\n\n📘 *Explanation:* {explanation}"
 
-    # Disable buttons (show only the options without callback)
     disabled_keyboard = [
         [InlineKeyboardButton(f"A. {options[0]}", callback_data="done")],
         [InlineKeyboardButton(f"B. {options[1]}", callback_data="done")],
@@ -288,35 +335,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-    # Move to next question
+    # Advance to next question
     session["index"] += 1
 
     if session["index"] < len(session["questions"]):
-        # Send next question
         next_q = session["questions"][session["index"]]
         await send_question_message(query.message.chat_id, context, session, next_q)
     else:
-        # Quiz finished – show summary
-        total = len(session["questions"])
-        correct = session["correct"]
-        incorrect = session["incorrect"]
-        skipped = session["skipped"]
-        percent = (correct / total * 100) if total > 0 else 0
-
-        summary = (
-            "🏁 *Quiz Completed!*\n\n"
-            f"📝 Total questions: {total}\n"
-            f"✅ Correct: {correct}\n"
-            f"❌ Incorrect: {incorrect}\n"
-            f"⏭️ Skipped: {skipped}\n"
-            f"🎯 Accuracy: {percent:.1f}%"
-        )
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=summary,
-            parse_mode="Markdown",
-        )
-        # Clear session
+        await finish_quiz(query.message.chat_id, context, session)
         del context.chat_data["quiz_session"]
 
 # ========== Owner Commands ==========
@@ -365,8 +391,20 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+# ========== Custom aiohttp app with health check ==========
+def create_web_app(update_queue, secret_token):
+    """Create aiohttp app with both /telegram webhook and / health endpoint."""
+    web_app = Application.create_web_app(update_queue, secret_token)
+    async def health(request):
+        return aiohttp.web.Response(text="OK")
+    web_app.router.add_get("/", health)
+    return web_app
+
 # ========== Main ==========
 def main():
+    if not RENDER_URL:
+        raise RuntimeError("Missing RENDER_EXTERNAL_URL environment variable")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -379,12 +417,19 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Start health-check server in a daemon thread
-    health_thread = threading.Thread(target=run_health_server, args=(PORT,), daemon=True)
-    health_thread.start()
+    # Build custom web app with health check
+    web_app = create_web_app(app.update_queue, "NorcetSecret123")
+    webhook_url = f"{RENDER_URL}/telegram"
 
-    # Start polling (blocking call)
-    app.run_polling(drop_pending_updates=True)
+    logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=webhook_url,
+        secret_token="NorcetSecret123",
+        drop_pending_updates=True,
+        web_app=web_app,                 # ✅ this works in v20.8
+    )
 
 if __name__ == "__main__":
     main()
