@@ -3,6 +3,7 @@ import json
 import gzip
 import random
 import logging
+import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -30,7 +31,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass  # keep logs clean
+        pass
 
 def run_health_server(port):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
@@ -81,25 +82,38 @@ def register_user(user_id: int):
         users.add(user_id)
         save_users()
 
-# ========== Helpers ==========
-async def send_question(chat_id, context: ContextTypes.DEFAULT_TYPE, q=None):
-    if q is None:
-        q = random.choice(QUESTIONS)
+# ========== Quiz session helpers ==========
+def init_quiz_session(questions: list):
+    """Create a new session dict."""
+    return {
+        "questions": questions,
+        "index": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "skipped": 0,
+    }
+
+async def send_question_message(chat_id, context: ContextTypes.DEFAULT_TYPE, session, q):
+    """Send a single question (current index) with inline buttons including Skip."""
+    idx = session["index"]
+    total = len(session["questions"])
     options = q["options"]
     correct_idx = q["correct_index"]
 
+    # Build keyboard: answer buttons + skip button
     keyboard = [
         [InlineKeyboardButton(f"A. {options[0]}", callback_data=f"ans:0:{correct_idx}")],
         [InlineKeyboardButton(f"B. {options[1]}", callback_data=f"ans:1:{correct_idx}")],
         [InlineKeyboardButton(f"C. {options[2]}", callback_data=f"ans:2:{correct_idx}")],
         [InlineKeyboardButton(f"D. {options[3]}", callback_data=f"ans:3:{correct_idx}")],
+        [InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{correct_idx}")],
     ]
-    context.chat_data["last_question"] = q
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"❓ {q['question']}",
+        text=f"📌 *Question {idx+1}/{total}*\n\n❓ {q['question']}",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
 
 # ========== Handlers ==========
@@ -115,10 +129,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📚 *NORCET Quiz Bot Help*\n\n"
         "/start – Welcome message\n"
         "/quiz – Random 1 question\n"
-        "/quiz 10 – Random 10 questions (max 50)\n"
+        "/quiz 10 – Start a 10‑question quiz (one by one with skip)\n"
         "/subjects – List available subjects\n"
         "/subject Anatomy – 1 question from Anatomy\n"
-        "/subject Anatomy 5 – 5 questions from Anatomy\n"
+        "/subject Anatomy 5 – 5 questions from Anatomy (one by one)\n"
         "/stats – Your personal score (persistent)\n"
         "/help – Show this message\n\n"
         "👑 *Owner only:*\n"
@@ -131,6 +145,7 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     register_user(user_id)
 
+    # Parse number of questions
     args = context.args
     if args and args[0].isdigit():
         count = int(args[0])
@@ -138,9 +153,13 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         count = 1
 
+    # Pick random questions and create session
     chosen = random.sample(QUESTIONS, min(count, len(QUESTIONS)))
-    for q in chosen:
-        await send_question(update.effective_chat.id, context, q)
+    session = init_quiz_session(chosen)
+    context.chat_data["quiz_session"] = session
+
+    # Send first question
+    await send_question_message(update.effective_chat.id, context, session, chosen[0])
 
 async def subjects_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📖 *Available subjects:*\n" + "\n".join([f"• {s}" for s in SUBJECTS])
@@ -155,6 +174,7 @@ async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please specify a subject. Example: /subject Anatomy")
         return
 
+    # Last argument may be a number
     count = 1
     if args[-1].isdigit():
         count = int(args[-1])
@@ -171,8 +191,10 @@ async def subject_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chosen = random.sample(matching, min(count, len(matching)))
-    for q in chosen:
-        await send_question(update.effective_chat.id, context, q)
+    session = init_quiz_session(chosen)
+    context.chat_data["quiz_session"] = session
+
+    await send_question_message(update.effective_chat.id, context, session, chosen[0])
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -192,51 +214,110 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "done":
-        return
+    data = query.data
+    if data == "done":
+        return  # ignore disabled buttons
 
     user_id = query.from_user.id
     register_user(user_id)
 
-    _, chosen_str, correct_str = query.data.split(":")
-    chosen = int(chosen_str)
-    correct = int(correct_str)
-
-    q = context.chat_data.get("last_question")
-    if not q:
-        await query.edit_message_text("⚠️ Question expired. Use /quiz again.")
+    session = context.chat_data.get("quiz_session")
+    if not session:
+        await query.edit_message_text("⚠️ No active quiz. Start a new one with /quiz.")
         return
 
+    # Parse callback data
+    if data.startswith("ans:"):
+        # Answer pressed
+        _, chosen_str, correct_str = data.split(":")
+        chosen = int(chosen_str)
+        correct = int(correct_str)
+        is_skip = False
+    elif data.startswith("skip:"):
+        # Skip pressed
+        _, correct_str = data.split(":")
+        correct = int(correct_str)
+        chosen = None
+        is_skip = True
+    else:
+        return  # unknown
+
+    # Get current question from session
+    idx = session["index"]
+    q = session["questions"][idx]
     options = q["options"]
     explanation = q.get("explanation", "No explanation available.")
 
+    # Update session counters and global stats
     uid = str(user_id)
     if uid not in user_scores:
         user_scores[uid] = {"correct": 0, "total": 0}
-    user_scores[uid]["total"] += 1
-    if chosen == correct:
-        user_scores[uid]["correct"] += 1
-        result = "✅ Correct!"
+
+    if is_skip:
+        session["skipped"] += 1
+        result_line = "⏭️ Skipped"
     else:
-        result = f"❌ Wrong! The correct answer is {chr(65+correct)}. {options[correct]}"
-    save_scores()
+        user_scores[uid]["total"] += 1
+        bot_stats["total_answers"] = bot_stats.get("total_answers", 0) + 1
+        save_bot_stats()
 
-    bot_stats["total_answers"] = bot_stats.get("total_answers", 0) + 1
-    save_bot_stats()
+        if chosen == correct:
+            session["correct"] += 1
+            user_scores[uid]["correct"] += 1
+            result_line = "✅ Correct!"
+        else:
+            session["incorrect"] += 1
+            result_line = f"❌ Wrong! The correct answer is {chr(65+correct)}. {options[correct]}"
+        save_scores()
 
-    message = f"{result}\n\n📘 *Explanation:* {explanation}"
+    # Build result message
+    message = f"{result_line}\n\n📘 *Explanation:* {explanation}"
 
+    # Disable buttons (show only the options without callback)
     disabled_keyboard = [
         [InlineKeyboardButton(f"A. {options[0]}", callback_data="done")],
         [InlineKeyboardButton(f"B. {options[1]}", callback_data="done")],
         [InlineKeyboardButton(f"C. {options[2]}", callback_data="done")],
         [InlineKeyboardButton(f"D. {options[3]}", callback_data="done")],
+        [InlineKeyboardButton("⏭️ Skip", callback_data="done")],
     ]
+
     await query.edit_message_text(
         message,
         reply_markup=InlineKeyboardMarkup(disabled_keyboard),
         parse_mode="Markdown",
     )
+
+    # Move to next question
+    session["index"] += 1
+
+    if session["index"] < len(session["questions"]):
+        # Send next question
+        next_q = session["questions"][session["index"]]
+        await send_question_message(query.message.chat_id, context, session, next_q)
+    else:
+        # Quiz finished – show summary
+        total = len(session["questions"])
+        correct = session["correct"]
+        incorrect = session["incorrect"]
+        skipped = session["skipped"]
+        percent = (correct / total * 100) if total > 0 else 0
+
+        summary = (
+            "🏁 *Quiz Completed!*\n\n"
+            f"📝 Total questions: {total}\n"
+            f"✅ Correct: {correct}\n"
+            f"❌ Incorrect: {incorrect}\n"
+            f"⏭️ Skipped: {skipped}\n"
+            f"🎯 Accuracy: {percent:.1f}%"
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=summary,
+            parse_mode="Markdown",
+        )
+        # Clear session
+        del context.chat_data["quiz_session"]
 
 # ========== Owner Commands ==========
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,7 +369,6 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register all handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -303,7 +383,7 @@ def main():
     health_thread = threading.Thread(target=run_health_server, args=(PORT,), daemon=True)
     health_thread.start()
 
-    # Start polling (blocking call – keeps the bot alive)
+    # Start polling (blocking call)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
