@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # ========== Configuration ==========
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # Set on Render
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 DATA_DIR = "data"
 
 # ========== Persistent storage ==========
@@ -273,15 +273,10 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== Custom web app with health check ==========
 def create_web_app(update_queue, secret_token):
-    """Create an aiohttp application that handles both Telegram webhook and health checks."""
-    # Use the library's built-in app creation (sets up /telegram route)
     app = Application.create_web_app(update_queue, secret_token)
-
-    # Add a simple health check on root path
     async def health(request):
         return aiohttp.web.Response(text="OK")
     app.router.add_get("/", health)
-
     return app
 
 # ========== Main ==========
@@ -291,7 +286,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -311,7 +305,7 @@ def main():
         webhook_url=webhook_url,
         secret_token="NorcetSecret123",
         drop_pending_updates=True,
-        request_handler=create_web_app,   # <-- custom handler with / health route
+        request_handler=create_web_app,
     )
 
 if __name__ == "__main__":
