@@ -14,7 +14,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import aiohttp.web
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 DATA_DIR = "data"
+PORT = int(os.environ.get("PORT", 8000))
 
 # ========== Persistent storage ==========
 def ensure_data_dir():
@@ -271,22 +272,27 @@ async def botstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-# ========== Custom web app with health check ==========
-def create_web_app(update_queue, secret_token):
-    app = Application.create_web_app(update_queue, secret_token)
-    async def health(request):
-        return aiohttp.web.Response(text="OK")
-    app.router.add_get("/", health)
-    return app
+# ========== Dummy HTTP server for Render health check ==========
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health server running on port {PORT}")
+    # Keep running forever
+    await asyncio.Event().wait()
 
 # ========== Main ==========
-def main():
-    PORT = int(os.environ.get("PORT", 8000))
-    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-
+async def main():
+    # Build Telegram bot application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register command handlers
+    # Register all handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("quiz", quiz))
@@ -297,26 +303,11 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # ----- Build custom aiohttp web app with health check -----
-    update_queue = app.update_queue
-    secret_token = "NorcetSecret123"
-    web_app = Application.create_web_app(update_queue, secret_token)
-
-    async def health(request):
-        return aiohttp.web.Response(text="OK")
-    web_app.router.add_get("/", health)
-
-    webhook_url = f"{RENDER_URL}/telegram"
-
-    logger.info(f"Starting webhook on port {PORT}, URL: {webhook_url}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url,
-        secret_token=secret_token,
-        drop_pending_updates=True,
-        web_app=web_app,          # <-- correct for v20.8
+    # Start polling and the dummy HTTP server concurrently
+    await asyncio.gather(
+        app.run_polling(drop_pending_updates=True),
+        run_http_server(),
     )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
